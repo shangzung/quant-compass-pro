@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  quant-compass-web:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./QuantCompass:/app/QuantCompass
+      - ./quant_compass_v2_ledger.db:/app/quant_compass_v2_ledger.db
+    environment:
+      - TZ=Asia/Taipei
+    restart: unless-stopped
