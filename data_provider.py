@@ -1,9 +1,9 @@
 """
-Real Taiwan Stock Data Provider & Data Quality Monitor.
-- Dynamic active universe via TWSE OpenAPI STOCK_DAY_ALL
+Real Taiwan Stock Data Provider & Data Quality Monitor (Hybrid Dynamic Screener).
+- Dynamic TWSE (上市) Hybrid Pool: 50% Top Turnover (主流資金) + 50% Top Momentum Liquid Stocks (強勢中小型股)
+- Dynamic TPEx (上櫃) Pool via official TPEx OpenAPI (replaces static OTC list; falls back safely if offline)
 - Historical OHLCV via yfinance (primary, with retry) + FinMind (fallback, including TAIEX for ^TWII)
-- Fundamentals via yfinance info (optional, graceful degradation)
-- Institutional Chips via FinMind (optional, graceful degradation)
+- Fundamentals via yfinance info (optional) & Institutional Chips via FinMind (optional)
 NEVER fabricates fake/random market prices or missing metrics.
 """
 from datetime import datetime, timedelta
@@ -22,17 +22,59 @@ class MarketDataProvider:
         self.finmind_token = finmind_token
         self.tz = pytz.timezone(config.TIMEZONE)
 
+    def _fetch_tpex_dynamic(self, max_otc: int = 12) -> List[Tuple[str, str, str, str]]:
+        """Fetches dynamic active & strong TPEx (上櫃) common stocks via official TPEx OpenAPI."""
+        try:
+            import requests
+            url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+            resp = requests.get(url, timeout=12)
+            rows = resp.json()
+            candidates = []
+            for r in rows:
+                code = str(r.get("SecuritiesCompanyCode", "")).strip()
+                name = str(r.get("CompanyName", "")).strip()
+                if len(code) != 4 or not code.isdigit() or code.startswith("00") or code.startswith("91"):
+                    continue
+                try:
+                    close = float(str(r.get("Close", "0")).replace(",", ""))
+                    chg = float(str(r.get("Change", "0")).replace(",", "").replace("+", ""))
+                    vol = float(str(r.get("TradingShares", "0")).replace(",", ""))
+                    val = float(str(r.get("TransactionAmount", "0")).replace(",", ""))
+                except ValueError:
+                    continue
+                prev = close - chg
+                chg_pct = (chg / prev * 100.0) if prev > 0 else 0.0
+                # Filter liquid OTC stocks (>= 800 lots & price >= MIN_PRICE)
+                if close >= config.MIN_PRICE and vol >= 800_000 and val > 0:
+                    candidates.append((code, name, "TWO", SECTOR_MAP.get(code, "上櫃活躍股"), val, chg_pct))
+
+            if not candidates:
+                return []
+
+            half = max(max_otc // 2, 1)
+            by_val = sorted(candidates, key=lambda x: x[4], reverse=True)[:half]
+            seen = {c[0] for c in by_val}
+            by_mom = [c for c in sorted(candidates, key=lambda x: x[5], reverse=True) if c[0] not in seen][: (max_otc - len(by_val))]
+            picked = by_val + by_mom
+            return [(c[0], c[1], c[2], c[3]) for c in picked]
+        except Exception:
+            return []
+
     def fetch_dynamic_tw_universe(self, top_n: int = 50) -> Tuple[List[Tuple[str, str, str, str]], str]:
         """
+        Builds a Hybrid Dynamic Taiwan Stock Pool:
+        - TWSE (上市): 50% Top Trading Value (主流大資金) + 50% Top Daily Momentum Liquid Stocks (強勢中小型股)
+        - TPEx (上櫃): Dynamic OTC Active + Momentum stocks via TPEx OpenAPI
         Returns (universe_list, source_label).
         Each item: (symbol, name, market, sector).
         """
+        twse_picked: List[Tuple[str, str, str, str]] = []
         try:
             import requests
             url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
             resp = requests.get(url, timeout=12)
             rows = resp.json()
-            candidates = []
+            all_valid = []
             for r in rows:
                 code = str(r.get("Code", "")).strip()
                 name = str(r.get("Name", "")).strip()
@@ -40,22 +82,56 @@ class MarketDataProvider:
                     continue
                 try:
                     close = float(str(r.get("ClosingPrice", "0")).replace(",", ""))
+                    chg = float(str(r.get("Change", "0")).replace(",", "").replace("+", ""))
+                    vol = float(str(r.get("TradeVolume", "0")).replace(",", ""))
                     val = float(str(r.get("TradeValue", "0")).replace(",", ""))
                 except ValueError:
                     continue
-                if close >= config.MIN_PRICE and val > 0:
-                    candidates.append((code, name, "TW", SECTOR_MAP.get(code, "上市活躍股"), val))
+                if close >= config.MIN_PRICE and val > 0 and vol > 0:
+                    prev = close - chg
+                    chg_pct = (chg / prev * 100.0) if prev > 0 else 0.0
+                    all_valid.append((code, name, "TW", SECTOR_MAP.get(code, "上市動態股"), val, vol, chg_pct))
 
-            candidates.sort(key=lambda x: x[4], reverse=True)
-            top_list = [(c[0], c[1], c[2], c[3]) for c in candidates[:top_n]]
-            seen = {x[0] for x in top_list}
-            for sym, nm, mkt, sec in config.DEFAULT_TW_UNIVERSE:
-                if mkt == "TWO" and sym not in seen:
-                    top_list.append((sym, nm, mkt, sec))
-            if top_list:
-                return top_list, "TWSE_OpenAPI+TPEx"
+            if all_valid:
+                half_val = max(top_n // 2, 1)
+                # 1) Top Trading Value (Mainstream institutional flow)
+                top_val = sorted(all_valid, key=lambda x: x[4], reverse=True)[:half_val]
+                seen = {c[0] for c in top_val}
+
+                # 2) Top Momentum among liquid stocks (>= 1,000 lots & >= NT$100M turnover)
+                liquid_pool = [c for c in all_valid if c[0] not in seen and c[5] >= 1_000_000 and c[4] >= 100_000_000]
+                top_mom = sorted(liquid_pool, key=lambda x: x[6], reverse=True)[: (top_n - len(top_val))]
+                for c in top_mom:
+                    seen.add(c[0])
+
+                # Backfill if momentum pool was smaller than quota
+                if len(top_val) + len(top_mom) < top_n:
+                    rem = [c for c in sorted(all_valid, key=lambda x: x[4], reverse=True) if c[0] not in seen]
+                    top_mom.extend(rem[: (top_n - len(top_val) - len(top_mom))])
+
+                twse_picked = [(c[0], c[1], c[2], c[3]) for c in (top_val + top_mom)]
         except Exception:
-            pass
+            twse_picked = []
+
+        # 3) Dynamic TPEx (OTC) pool
+        otc_quota = max(10, top_n // 3)
+        tpex_picked = self._fetch_tpex_dynamic(max_otc=otc_quota)
+
+        if twse_picked:
+            seen_all = {x[0] for x in twse_picked}
+            if tpex_picked:
+                for item in tpex_picked:
+                    if item[0] not in seen_all:
+                        twse_picked.append(item)
+                        seen_all.add(item[0])
+                return twse_picked, "TWSE_Hybrid+TPEx_OpenAPI"
+            else:
+                for sym, nm, mkt, sec in config.DEFAULT_TW_UNIVERSE:
+                    if mkt == "TWO" and sym not in seen_all:
+                        twse_picked.append((sym, nm, mkt, sec))
+                        seen_all.add(sym)
+                return twse_picked, "TWSE_Hybrid+TPEx_Fallback"
+
         return list(config.DEFAULT_TW_UNIVERSE), "DEFAULT_UNIVERSE_FALLBACK"
 
     def fetch_history(
@@ -92,7 +168,6 @@ class MarketDataProvider:
                         auto_adjust=False,
                     )
                     if df is None or df.empty:
-                        # Secondary yfinance API path (Ticker.history)
                         df = yf.Ticker(ticker).history(period=f"{lookback_days}d", auto_adjust=False)
                     if df is not None and not df.empty:
                         if isinstance(df.columns, pd.MultiIndex):
